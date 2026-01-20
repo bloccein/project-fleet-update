@@ -2,36 +2,63 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
+from functools import lru_cache
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Query
 from fastapi.responses import FileResponse
 from packaging.version import Version, InvalidVersion
 
-from db import init_db, q, exec_
-from udp_device import start_udp_listener
-from smp_ops import upload_image_udp, UdpTarget
-from hash_compute import compute_hash
-
-import logging
-
-log = logging.getLogger()
+from .db import init_db, q, exec_
+from .udp_device import start_udp_listener
+from .smp_ops import upload_image_udp, UdpTarget
+from .hash_compute import compute_hash
 
 DATA_DIR = Path("data")
 FW_DIR = DATA_DIR / "firmware"
 FW_DIR.mkdir(parents=True, exist_ok=True)
 
-UDP_HOST = "0.0.0.0"
-UDP_PORT = 9999
+def _ensure_logging() -> None:
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
+@lru_cache(maxsize=1)
+def _log() -> logging.Logger:
+    """
+    Prefer the hosting server logger if present (uvicorn/gunicorn), otherwise fall back.
+    """
+    for name in ("uvicorn.error", "gunicorn.error"):
+        candidate = logging.getLogger(name)
+        if candidate.hasHandlers():
+            return candidate
+    return logging.getLogger(__name__)
+
+
+UDP_HOST = os.getenv("UDP_HOST", "0.0.0.0")
+UDP_PORT = int(os.getenv("UDP_PORT", "9999"))
+# Useful for verifying from another machine: send any UDP datagram and get a reply.
+UDP_PONG = os.getenv("UDP_PONG", "1").strip().lower() not in {"0", "false", "no", "off"}
+UDP_PONG_ANY = os.getenv("UDP_PONG_ANY", "0").strip().lower() in {"1", "true", "yes", "on"}
+UDP_LOG_PINGS = os.getenv("UDP_LOG_PINGS", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # If you need smpclient UDP transport params (timeouts/mtu), set here:
 DEFAULT_SMP_UDP_PARAMS: dict[str, Any] = {}
 
+app = FastAPI(title="SMP Repo Server (HTTP admin, UDP device pings)", version="1.0.0")
 
 UDP_TRANSPORT = None
 WORKERS: dict[str, asyncio.Task] = {}
@@ -82,25 +109,39 @@ def _version_lt(a: str, b: str) -> bool:
     return Version(a) < Version(b)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+@app.on_event("startup")
+async def _startup():
     global UDP_TRANSPORT
+    _ensure_logging()
     init_db()
     try:
         UDP_TRANSPORT = await start_udp_listener(
-            UDP_HOST, UDP_PORT, handle_device_ping
+            UDP_HOST,
+            UDP_PORT,
+            handle_device_ping,
+            respond_pong=UDP_PONG,
+            respond_any=UDP_PONG_ANY,
         )
-        yield
-    finally:
-        if UDP_TRANSPORT is not None:
-            UDP_TRANSPORT.close()
-            UDP_TRANSPORT = None
+        # Use WARNING so it shows up even when the environment defaults to WARNING.
+        _log().warning(
+            "UDP listener started on %s:%s (pong=%s, pong_any=%s)",
+            UDP_HOST,
+            UDP_PORT,
+            UDP_PONG,
+            UDP_PONG_ANY,
+        )
+    except Exception:
+        _log().exception("Failed to start UDP listener on %s:%s", UDP_HOST, UDP_PORT)
+        raise
 
-app = FastAPI(
-    title="SMP Repo Server (HTTP admin, UDP device pings)",
-    version="1.0.0",
-    lifespan=lifespan,
-)
+
+@app.on_event("shutdown")
+async def _shutdown():
+    global UDP_TRANSPORT
+    if UDP_TRANSPORT is not None:
+        UDP_TRANSPORT.close()
+        UDP_TRANSPORT = None
+
 
 # -------------------------
 # Admin HTTP: firmware repo
@@ -128,7 +169,7 @@ async def upload_firmware(
     if not content:
         raise HTTPException(400, "Empty upload")
 
-    digest = sha256(content).hexdigest()
+    digest = compute_hash(content)
 
     # Deduplicate by hash
     exists = q("SELECT sha256, version, size_bytes, created_at FROM firmware WHERE sha256=?", (digest,))
@@ -189,6 +230,9 @@ def handle_device_ping(msg: dict, addr: tuple[str, int]) -> None:
 
     if not device_id or not version:
         return
+
+    if UDP_LOG_PINGS:
+        _log().info("UDP ping device_id=%s version=%s smp_port=%s from=%s:%s", device_id, version, smp_port, addr[0], addr[1])
 
     try:
         Version(version)

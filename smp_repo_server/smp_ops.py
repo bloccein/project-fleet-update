@@ -10,6 +10,8 @@ from smpclient.requests.image_management import ImageStatesRead, ImageStatesWrit
 from smpclient.requests.os_management import ResetWrite
 from smpclient import error
 
+from .hash_compute import compute_hash
+
 
 @dataclass(frozen=True)
 class UdpTarget:
@@ -31,14 +33,14 @@ async def upload_image_udp(
     progress_cb: Callable[[int, int, str], Awaitable[None]],
 ) -> None:
     total = len(image)
-    img_hash = sha256(image).digest()
+    img_hash = compute_hash(image)
 
     transport = SMPUDPTransport(**target.params)
-    address = f"{target.host}:{target.port}"
+    # address = f"{target.host}:{target.port}"
 
-    await progress_cb(0, total, f"connecting {address}")
+    await progress_cb(0, total, f"connecting {target.host}")
 
-    async with SMPClient(transport, address) as client:
+    async with SMPClient(transport, target.host) as client:
         r = await client.request(ImageStatesRead())
         if error(r):
             raise SMPFailure(f"ImageStatesRead error: {r}")
@@ -53,7 +55,7 @@ async def upload_image_udp(
             raise SMPFailure(f"Upload incomplete: {uploaded}/{total}")
 
         await progress_cb(total, total, "setting image state")
-        wr = await client.request(ImageStatesWrite(hash=img_hash if not confirm else None, confirm=confirm))
+        wr = await client.request(ImageStatesWrite(hash=compute_hash if not confirm else None, confirm=confirm))
         if error(wr):
             raise SMPFailure(f"ImageStatesWrite error: {wr}")
 
