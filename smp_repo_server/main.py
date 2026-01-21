@@ -1,28 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 from functools import lru_cache
 from datetime import datetime, timezone
-from hashlib import sha256
-from pathlib import Path
 from typing import Any, Optional
-from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Query
-from fastapi.responses import FileResponse
 from packaging.version import Version, InvalidVersion
 
-from .db import init_db, q, exec_
+from .db import init_db, q, exec_, upload_firmware_to_minio, download_firmware_from_minio
 from .udp_device import start_udp_listener
 from .smp_ops import upload_image_udp, UdpTarget
 from .hash_compute import compute_hash
-
-DATA_DIR = Path("data")
-FW_DIR = DATA_DIR / "firmware"
-FW_DIR.mkdir(parents=True, exist_ok=True)
 
 def _ensure_logging() -> None:
     root = logging.getLogger()
@@ -84,25 +75,14 @@ def _ensure_worker(device_id: str) -> None:
 
 
 def _latest_firmware() -> Optional[dict[str, Any]]:
-    rows = q("SELECT version, sha256, filename, size_bytes, created_at FROM firmware")
+    """Return the most recently inserted firmware (by created_at timestamp)."""
+    rows = q(
+        "SELECT version, sha256, filename, size_bytes, created_at FROM firmware ORDER BY created_at DESC LIMIT 1",
+        (),
+    )
     if not rows:
         return None
-
-    parsed: list[tuple[Version, dict[str, Any]]] = []
-    for r in rows:
-        d = dict(r)
-        try:
-            v = Version(d["version"])
-        except InvalidVersion:
-            # if someone uploaded junk version, ignore it for auto-update
-            continue
-        parsed.append((v, d))
-
-    if not parsed:
-        return None
-
-    parsed.sort(key=lambda x: x[0], reverse=True)
-    return parsed[0][1]
+    return dict(rows[0])
 
 
 def _version_lt(a: str, b: str) -> bool:
@@ -172,42 +152,47 @@ async def upload_firmware(
     digest = compute_hash(content)
 
     # Deduplicate by hash
-    exists = q("SELECT sha256, version, size_bytes, created_at FROM firmware WHERE sha256=?", (digest,))
+    exists = q("SELECT sha256, version, size_bytes, created_at FROM firmware WHERE sha256=%s", (digest,))
     if exists:
         d = dict(exists[0])
         d["dedup"] = True
         return d
 
-    fw_name = f"{digest[:12]}_{Path(orig_name).name}"
-    (FW_DIR / fw_name).write_bytes(content)
+    # Upload to MinIO
+    object_name = upload_firmware_to_minio(digest, content)
 
     exec_(
-        "INSERT INTO firmware(sha256, version, filename, size_bytes, created_at) VALUES(?,?,?,?,?)",
-        (digest, version, fw_name, len(content), now_iso()),
+        "INSERT INTO firmware(sha256, version, filename, size_bytes, created_at) VALUES(%s,%s,%s,%s,%s)",
+        (digest, version, object_name, len(content), now_iso()),
     )
     return {"sha256": digest, "version": version, "size_bytes": len(content)}
 
 
 @app.get("/firmware")
 def list_firmware() -> list[dict[str, Any]]:
-    rows = q("SELECT version, sha256, size_bytes, created_at FROM firmware ORDER BY created_at DESC")
+    rows = q("SELECT version, sha256, size_bytes, created_at FROM firmware ORDER BY created_at DESC", ())
     return [dict(r) for r in rows]
 
 
 @app.get("/firmware/{sha256}/download")
 def download_firmware(sha256_hex: str):
-    rows = q("SELECT filename FROM firmware WHERE sha256=?", (sha256_hex,))
+    from fastapi.responses import Response
+    from minio.error import S3Error
+
+    rows = q("SELECT sha256 FROM firmware WHERE sha256=%s", (sha256_hex,))
     if not rows:
         raise HTTPException(404, "not found")
-    path = FW_DIR / rows[0]["filename"]
-    if not path.exists():
-        raise HTTPException(500, "file missing on disk")
-    return FileResponse(path)
+
+    try:
+        content = download_firmware_from_minio(sha256_hex)
+        return Response(content=content, media_type="application/octet-stream")
+    except S3Error:
+        raise HTTPException(500, "file missing in storage")
 
 
 @app.get("/devices")
 def list_devices() -> list[dict[str, Any]]:
-    rows = q("SELECT device_id, last_ip, last_seen_at, last_version, last_status, last_message FROM device ORDER BY device_id")
+    rows = q("SELECT device_id, last_ip, last_seen_at, last_version, last_status, last_message FROM device ORDER BY device_id", ())
     return [dict(r) for r in rows]
 
 
@@ -241,7 +226,7 @@ def handle_device_ping(msg: dict, addr: tuple[str, int]) -> None:
         exec_(
             """
             INSERT INTO device(device_id, last_ip, last_seen_at, last_version, last_status, last_message)
-            VALUES(?,?,?,?,?,?)
+            VALUES(%s,%s,%s,%s,%s,%s)
             ON CONFLICT(device_id) DO UPDATE SET
               last_ip=excluded.last_ip,
               last_seen_at=excluded.last_seen_at,
@@ -257,7 +242,7 @@ def handle_device_ping(msg: dict, addr: tuple[str, int]) -> None:
     exec_(
         """
         INSERT INTO device(device_id, last_ip, last_seen_at, last_version, last_status, last_message)
-        VALUES(?,?,?,?,?,?)
+        VALUES(%s,%s,%s,%s,%s,%s)
         ON CONFLICT(device_id) DO UPDATE SET
           last_ip=excluded.last_ip,
           last_seen_at=excluded.last_seen_at,
@@ -282,8 +267,8 @@ def handle_device_ping(msg: dict, addr: tuple[str, int]) -> None:
 async def _device_worker(device_id: str) -> None:
     """
     On each ping:
-    - pick latest firmware by version
-    - if device version < latest version => upload latest image via SMP/UDP to device
+    - pick latest inserted firmware (by created_at)
+    - download from MinIO and upload via SMP/UDP to device
     """
     while True:
         await _ev(device_id).wait()
@@ -295,38 +280,32 @@ async def _device_worker(device_id: str) -> None:
 
         latest = _latest_firmware()
         if latest is None:
-            exec_("UPDATE device SET last_status=?, last_message=? WHERE device_id=?",
+            exec_("UPDATE device SET last_status=%s, last_message=%s WHERE device_id=%s",
                   ("idle", "no firmware available on server", device_id))
             continue
 
         dev_ver = state["version"]
         srv_ver = latest["version"]
 
-        # If already up-to-date, do nothing
-        if not _version_lt(dev_ver, srv_ver):
-            exec_("UPDATE device SET last_status=?, last_message=? WHERE device_id=?",
-                  ("ok", f"up-to-date ({dev_ver})", device_id))
+        # Load image bytes from MinIO
+        try:
+            image = download_firmware_from_minio(latest["sha256"])
+        except Exception:
+            exec_("UPDATE device SET last_status=%s, last_message=%s WHERE device_id=%s",
+                  ("failed", "server firmware file missing in storage", device_id))
             continue
 
-        # Load image bytes
-        fw_path = FW_DIR / latest["filename"]
-        if not fw_path.exists():
-            exec_("UPDATE device SET last_status=?, last_message=? WHERE device_id=?",
-                  ("failed", "server firmware file missing on disk", device_id))
-            continue
-
-        image = fw_path.read_bytes()
         ip = state["ip"]
         port = state["smp_port"]
 
         async def progress_cb(uploaded: int, total: int, msg: str):
             exec_(
-                "UPDATE device SET last_status=?, last_message=? WHERE device_id=?",
+                "UPDATE device SET last_status=%s, last_message=%s WHERE device_id=%s",
                 ("running", f"{msg} {uploaded}/{total}", device_id),
             )
 
         try:
-            exec_("UPDATE device SET last_status=?, last_message=? WHERE device_id=?",
+            exec_("UPDATE device SET last_status=%s, last_message=%s WHERE device_id=%s",
                   ("running", f"updating {dev_ver} -> {srv_ver} ({latest['sha256'][:8]}...)", device_id))
 
             await upload_image_udp(
@@ -337,9 +316,9 @@ async def _device_worker(device_id: str) -> None:
                 progress_cb=progress_cb,
             )
 
-            exec_("UPDATE device SET last_status=?, last_message=? WHERE device_id=?",
+            exec_("UPDATE device SET last_status=%s, last_message=%s WHERE device_id=%s",
                   ("ok", f"uploaded {srv_ver} to {ip}:{port}", device_id))
 
         except Exception as e:
-            exec_("UPDATE device SET last_status=?, last_message=? WHERE device_id=?",
+            exec_("UPDATE device SET last_status=%s, last_message=%s WHERE device_id=%s",
                   ("failed", f"{type(e).__name__}: {e}", device_id))
